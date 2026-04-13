@@ -1,9 +1,7 @@
 name: Shopify → Firestore Sync
 
 on:
-  schedule:
-    - cron: '*/5 * * * *'   # every 5 minutes
-  workflow_dispatch:         # allow manual trigger from GitHub Actions UI
+  workflow_dispatch:
 
 jobs:
   sync:
