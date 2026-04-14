@@ -218,61 +218,38 @@ def get_relevant_shopify_docs(
 ) -> dict[str, tuple[str, dict]]:
     """
     Returns { shopifyOrderId: (firestoreDocId, docData) }
-    using two cheap targeted queries instead of reading the entire collection:
 
-    Query A — today's Shopify orders (covers new-order dedup for same-day inserts)
-    Query B — specific shopifyOrderIds returned in this batch (covers edits /
-              cancellations on older orders that predate today)
-
-    Both results are merged into one dict; duplicates (same doc appearing in
-    both queries) are deduplicated by Firestore doc ID.
+    Queries only the specific shopifyOrderIds returned in this batch.
+    This requires no composite index and works on Firestore free tier.
+    Covers all cases:
+      - New order     → not in result → will be inserted
+      - Edited order  → found → will be patched
+      - Cancelled     → found → will be transitioned
+      - Already synced, no changes → found → skipped
     """
     result: dict[str, tuple[str, dict]] = {}
 
-    # ── Query A: today's orders ────────────────────────────────────
-    start_of_day = datetime.now(timezone.utc).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
-    today_docs = (
-        db.collection("orders")
-        .where("source",    "==", "shopify")
-        .where("createdAt", ">=", start_of_day)
-        .stream()
-    )
-    for d in today_docs:
-        data = d.to_dict()
-        sid  = data.get("shopifyOrderId")
-        if sid:
-            result[sid] = (d.id, data)
+    if not batch_ids:
+        return result
 
-    log.info("Query A (today's orders): %d docs", len(result))
+    # Firestore "in" operator supports max 30 values — chunk if needed
+    def chunks(lst, n):
+        for i in range(0, len(lst), n):
+            yield lst[i:i + n]
 
-    # ── Query B: specific IDs from this batch (older order edits/cancels) ──
-    # Only query IDs not already loaded by Query A
-    missing_ids = [bid for bid in batch_ids if bid not in result]
+    for chunk in chunks(batch_ids, 30):
+        docs = (
+            db.collection("orders")
+            .where("shopifyOrderId", "in", chunk)
+            .stream()
+        )
+        for d in docs:
+            data = d.to_dict()
+            sid  = data.get("shopifyOrderId")
+            if sid:
+                result[sid] = (d.id, data)
 
-    if missing_ids:
-        # Firestore "in" operator supports max 30 values — chunk if needed
-        def chunks(lst, n):
-            for i in range(0, len(lst), n):
-                yield lst[i:i + n]
-
-        batch_hits = 0
-        for chunk in chunks(missing_ids, 30):
-            batch_docs = (
-                db.collection("orders")
-                .where("shopifyOrderId", "in", chunk)
-                .stream()
-            )
-            for d in batch_docs:
-                data = d.to_dict()
-                sid  = data.get("shopifyOrderId")
-                if sid and sid not in result:
-                    result[sid] = (d.id, data)
-                    batch_hits += 1
-
-        log.info("Query B (batch older orders): %d extra docs", batch_hits)
-
+    log.info("Firestore lookup: %d/%d batch IDs already exist", len(result), len(batch_ids))
     return result
 
 
