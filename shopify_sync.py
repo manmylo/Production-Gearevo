@@ -266,7 +266,7 @@ def is_auto_collect(service: str, note: str) -> bool:
     return is_express or is_engrave
 
 
-
+def main():
     db       = get_firestore_client()
     due_days = get_current_due_days(db)
 
