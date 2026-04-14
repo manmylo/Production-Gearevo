@@ -32,7 +32,7 @@ SA_JSON              = os.environ["FIREBASE_SERVICE_ACCOUNT_JSON"]  # full JSON 
 # ──────────────────────────────────────────────
 # Keys are lowercase fragments to match against line item titles
 SERVICE_KEYWORDS = {
-    "servis asahan":          "Sharpening",
+    "servis asah pisau":      "Sharpening",
     "gearevo kydex":          "Kydex Sheath",
     "laser engraving":        "Engraving",
 }
@@ -163,6 +163,12 @@ def main():
         phone      = (customer.get("phone") or "").strip()
         order_name = order.get("name", "")   # e.g. "#1234" — Shopify display name
 
+        # Detect express order
+        is_express = any(
+            "express" in (item.get("title") or "").lower()
+            for item in order.get("line_items", [])
+        )
+
         doc = {
             "shopifyOrderId": shopify_id,
             "shopifyOrderName": order_name,   # "#1234" — shown in app
@@ -172,6 +178,7 @@ def main():
             "storeId": "",           # staff fills this in before first WA is sent
             "status":  "pending",
             "source":  "shopify",
+            "note":    "Express" if is_express else "",
             "createdAt":   firestore.SERVER_TIMESTAMP,
             "notifiedAt":  None,
             "readyAt":     None,
