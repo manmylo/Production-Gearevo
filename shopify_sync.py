@@ -212,18 +212,67 @@ def get_current_due_days(db: firestore.Client) -> int:
     return 3
 
 
-def get_existing_shopify_docs(db: firestore.Client) -> dict[str, tuple[str, dict]]:
+def get_relevant_shopify_docs(
+    db: firestore.Client,
+    batch_ids: list[str],
+) -> dict[str, tuple[str, dict]]:
     """
     Returns { shopifyOrderId: (firestoreDocId, docData) }
-    for every Firestore order that has a shopifyOrderId.
+    using two cheap targeted queries instead of reading the entire collection:
+
+    Query A — today's Shopify orders (covers new-order dedup for same-day inserts)
+    Query B — specific shopifyOrderIds returned in this batch (covers edits /
+              cancellations on older orders that predate today)
+
+    Both results are merged into one dict; duplicates (same doc appearing in
+    both queries) are deduplicated by Firestore doc ID.
     """
-    docs   = db.collection("orders").where("shopifyOrderId", "!=", "").stream()
-    result = {}
-    for d in docs:
+    result: dict[str, tuple[str, dict]] = {}
+
+    # ── Query A: today's orders ────────────────────────────────────
+    start_of_day = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    today_docs = (
+        db.collection("orders")
+        .where("source",    "==", "shopify")
+        .where("createdAt", ">=", start_of_day)
+        .stream()
+    )
+    for d in today_docs:
         data = d.to_dict()
         sid  = data.get("shopifyOrderId")
         if sid:
             result[sid] = (d.id, data)
+
+    log.info("Query A (today's orders): %d docs", len(result))
+
+    # ── Query B: specific IDs from this batch (older order edits/cancels) ──
+    # Only query IDs not already loaded by Query A
+    missing_ids = [bid for bid in batch_ids if bid not in result]
+
+    if missing_ids:
+        # Firestore "in" operator supports max 30 values — chunk if needed
+        def chunks(lst, n):
+            for i in range(0, len(lst), n):
+                yield lst[i:i + n]
+
+        batch_hits = 0
+        for chunk in chunks(missing_ids, 30):
+            batch_docs = (
+                db.collection("orders")
+                .where("shopifyOrderId", "in", chunk)
+                .stream()
+            )
+            for d in batch_docs:
+                data = d.to_dict()
+                sid  = data.get("shopifyOrderId")
+                if sid and sid not in result:
+                    result[sid] = (d.id, data)
+                    batch_hits += 1
+
+        log.info("Query B (batch older orders): %d extra docs", batch_hits)
+
     return result
 
 
@@ -231,12 +280,24 @@ def get_existing_shopify_docs(db: firestore.Client) -> dict[str, tuple[str, dict
 # MAIN
 # ──────────────────────────────────────────────
 def main():
-    db            = get_firestore_client()
-    existing_docs = get_existing_shopify_docs(db)
-    due_days      = get_current_due_days(db)
-    log.info("Firestore already has %d Shopify-sourced orders | due days: %d", len(existing_docs), due_days)
+    db       = get_firestore_client()
+    due_days = get_current_due_days(db)
 
     raw_orders = fetch_shopify_orders()
+
+    # Extract IDs for orders that match our services — these are the only ones
+    # we'll ever read or write, so no point querying Firestore for others
+    batch_ids = [
+        str(o["id"])
+        for o in raw_orders
+        if map_services(o.get("line_items", []))
+    ]
+
+    existing_docs = get_relevant_shopify_docs(db, batch_ids)
+    log.info(
+        "Batch: %d relevant Shopify order(s) | Firestore loaded: %d doc(s) | due days: %d",
+        len(batch_ids), len(existing_docs), due_days,
+    )
     added = updated = cancelled_count = 0
 
     for order in raw_orders:
