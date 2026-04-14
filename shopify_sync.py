@@ -12,6 +12,8 @@ New/updated behaviour:
   - CANCELLED orders → status set to "cancelled", shopifyCancelReason
                        added, storeId requirement bypassed
   - Delivery method  → fulfilmentType: "Shipping" | "In-Store Pickup"
+  - EXPRESS / ENGRAVING orders → auto-collected on insert (no workflow
+                       tracking needed — short turnaround tasks)
 """
 
 import os
@@ -139,6 +141,21 @@ def map_fulfilment_type(order: dict) -> tuple[str, str]:
     # Has shipping lines but no keyword matched — use raw title as carrier name
     raw_title = (shipping_lines[0].get("title") or "").strip()
     return "Shipping", raw_title
+
+
+# ──────────────────────────────────────────────
+# AUTO-COLLECT SHORTCUT
+# ──────────────────────────────────────────────
+def is_auto_collect(service: str, note: str) -> bool:
+    """
+    Express orders and any Engraving service are done on-the-spot —
+    no workflow tracking needed. Mark them collected immediately.
+    Covers: Express flag, Engraving, Sharpening + Engraving,
+    Kydex + Engraving, Sharpening + Kydex + Engraving.
+    """
+    is_express = "express" in (note or "").lower()
+    is_engrave = "engrav"  in (service or "").lower()
+    return is_express or is_engrave
 
 
 # ──────────────────────────────────────────────
@@ -355,8 +372,26 @@ def main():
             else:
                 log.debug("No changes for order %s", shopify_id)
 
+            # Auto-collect if the order became Express/Engraving and
+            # isn't already in a terminal state
+            current_status = fs_data.get("status", "pending")
+            if (
+                is_auto_collect(service, note)
+                and current_status not in ("collected", "cancelled")
+            ):
+                ref.update({
+                    "status":      "collected",
+                    "collectedAt": firestore.SERVER_TIMESTAMP,
+                })
+                log.info(
+                    "Auto-collected order %s (%s) — Express/Engraving shortcut",
+                    shopify_id, order_name,
+                )
+
         else:
             # ── INSERT ─────────────────────────────────────────────
+            auto_collect = is_auto_collect(service, note)
+
             doc = {
                 "shopifyOrderId":   shopify_id,
                 "shopifyOrderName": order_name,
@@ -366,14 +401,14 @@ def main():
                 "fulfilmentType":   fulfilment_type,
                 "carrierName":      carrier_name,
                 "storeId":          "",
-                "status":           "cancelled" if is_cancelled else "pending",
+                "status":           "cancelled" if is_cancelled else ("collected" if auto_collect else "pending"),
                 "source":           "shopify",
                 "note":             note,
                 "dueDays":          due_days,
                 "createdAt":        firestore.SERVER_TIMESTAMP,
                 "notifiedAt":       None,
                 "readyAt":          None,
-                "collectedAt":      None,
+                "collectedAt":      firestore.SERVER_TIMESTAMP if auto_collect else None,
             }
             if is_cancelled:
                 doc["shopifyCancelReason"] = cancel_reason
@@ -383,10 +418,11 @@ def main():
             existing_docs[shopify_id] = ("", doc)
             added += 1
             log.info(
-                "Added order %s (%s) — service: %s | fulfilment: %s%s%s",
+                "Added order %s (%s) — service: %s | fulfilment: %s%s%s%s",
                 shopify_id, order_name, service, fulfilment_type,
                 f" [{carrier_name}]" if carrier_name else "",
-                " [CANCELLED]" if is_cancelled else "",
+                " [CANCELLED]"      if is_cancelled  else "",
+                " [AUTO-COLLECTED]" if auto_collect  else "",
             )
 
     log.info(
