@@ -256,7 +256,17 @@ def get_relevant_shopify_docs(
 # ──────────────────────────────────────────────
 # MAIN
 # ──────────────────────────────────────────────
-def main():
+def is_auto_collect(service: str, note: str) -> bool:
+    """
+    Express orders and any Engraving service are done on-the-spot —
+    no workflow tracking needed. Mark them collected immediately.
+    """
+    is_express = "express" in (note or "").lower()
+    is_engrave = "engrav" in (service or "").lower()
+    return is_express or is_engrave
+
+
+
     db       = get_firestore_client()
     due_days = get_current_due_days(db)
 
@@ -352,11 +362,26 @@ def main():
                 ref.update(updates)
                 updated += 1
                 log.info("Updated order %s (%s) — %s", shopify_id, order_name, list(updates.keys()))
-            else:
-                log.debug("No changes for order %s", shopify_id)
+
+            # Auto-collect if the order became Express/Engraving and isn't already terminal
+            current_status = fs_data.get("status", "pending")
+            if (
+                is_auto_collect(service, note)
+                and current_status not in ("collected", "cancelled")
+            ):
+                ref.update({
+                    "status":      "collected",
+                    "collectedAt": firestore.SERVER_TIMESTAMP,
+                })
+                log.info(
+                    "Auto-collected order %s (%s) — Express/Engraving shortcut",
+                    shopify_id, order_name,
+                )
 
         else:
             # ── INSERT ─────────────────────────────────────────────
+            auto_collect = is_auto_collect(service, note)
+
             doc = {
                 "shopifyOrderId":   shopify_id,
                 "shopifyOrderName": order_name,
@@ -366,14 +391,14 @@ def main():
                 "fulfilmentType":   fulfilment_type,
                 "carrierName":      carrier_name,
                 "storeId":          "",
-                "status":           "cancelled" if is_cancelled else "pending",
+                "status":           "cancelled" if is_cancelled else ("collected" if auto_collect else "pending"),
                 "source":           "shopify",
                 "note":             note,
                 "dueDays":          due_days,
                 "createdAt":        firestore.SERVER_TIMESTAMP,
                 "notifiedAt":       None,
                 "readyAt":          None,
-                "collectedAt":      None,
+                "collectedAt":      firestore.SERVER_TIMESTAMP if auto_collect else None,
             }
             if is_cancelled:
                 doc["shopifyCancelReason"] = cancel_reason
