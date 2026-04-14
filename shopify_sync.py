@@ -3,9 +3,15 @@ shopify_sync.py
 ---------------
 Fetches recent Shopify orders, filters for Layo services
 (Servis Asahan, Gearevo Kydex, Laser Engraving), maps them
-to app service labels, and pushes new orders to Firestore.
-Skips any order whose shopifyOrderId already exists in Firestore.
-Runs every 5 minutes via GitHub Actions cron.
+to app service labels, and upserts to Firestore.
+
+New/updated behaviour:
+  - NEW orders    → inserted as before
+  - EDITED orders → mutable fields (name, phone, service, note,
+                    fulfilmentType) are patched in Firestore
+  - CANCELLED orders → status set to "cancelled", shopifyCancelReason
+                       added, storeId requirement bypassed
+  - Delivery method  → fulfilmentType: "Shipping" | "In-Store Pickup"
 """
 
 import os
@@ -22,27 +28,22 @@ log = logging.getLogger(__name__)
 # ──────────────────────────────────────────────
 # CONFIG — all values come from GitHub Secrets
 # ──────────────────────────────────────────────
-SHOPIFY_STORE_URL    = os.environ["SHOPIFY_STORE_URL"]       # e.g. yourstore.myshopify.com
-SHOPIFY_ACCESS_TOKEN = os.environ["SHOPIFY_ACCESS_TOKEN"]    # Admin API access token
-FIREBASE_PROJECT_ID  = os.environ["FIREBASE_PROJECT_ID"]    # e.g. production-tracker-3a3b1
-SA_JSON              = os.environ["FIREBASE_SERVICE_ACCOUNT_JSON"]  # full JSON string
+SHOPIFY_STORE_URL    = os.environ["SHOPIFY_STORE_URL"]
+SHOPIFY_ACCESS_TOKEN = os.environ["SHOPIFY_ACCESS_TOKEN"]
+FIREBASE_PROJECT_ID  = os.environ["FIREBASE_PROJECT_ID"]
+SA_JSON              = os.environ["FIREBASE_SERVICE_ACCOUNT_JSON"]
 
 # ──────────────────────────────────────────────
 # SERVICE MAPPING  (Shopify line item → app label)
 # ──────────────────────────────────────────────
-# Keys are lowercase fragments to match against line item titles
 SERVICE_KEYWORDS = {
-    "servis asah pisau":      "Sharpening",
-    "gearevo kydex":          "Kydex Sheath",
-    "laser engraving":        "Engraving",
+    "servis asah pisau": "Sharpening",
+    "gearevo kydex":     "Kydex Sheath",
+    "laser engraving":   "Engraving",
 }
 
-# Combined label lookup (sorted longest-match first so combos win)
+
 def map_services(line_items: list[dict]) -> str | None:
-    """
-    Inspect all line items, collect every matched service,
-    return the combined label string or None if no match.
-    """
     found = []
     for item in line_items:
         title = (item.get("title") or "").lower()
@@ -53,10 +54,9 @@ def map_services(line_items: list[dict]) -> str | None:
     if not found:
         return None
 
-    # Canonical combination labels
-    has_sharp   = "Sharpening"  in found
+    has_sharp   = "Sharpening"   in found
     has_kydex   = "Kydex Sheath" in found
-    has_engrave = "Engraving"   in found
+    has_engrave = "Engraving"    in found
 
     if has_sharp and has_kydex and has_engrave:
         return "Sharpening + Kydex + Engraving"
@@ -73,12 +73,35 @@ def map_services(line_items: list[dict]) -> str | None:
     if has_engrave:
         return "Engraving"
 
-    return " + ".join(found)   # fallback
+    return " + ".join(found)
 
 
 # ──────────────────────────────────────────────
-# SHOPIFY  — fetch orders updated in last 10 min
-# (overlap to survive any clock drift / late webhooks)
+# DELIVERY METHOD
+# ──────────────────────────────────────────────
+def map_fulfilment_type(order: dict) -> str:
+    """
+    Determine if the order is for shipping or in-store pickup.
+    Checks shipping_lines titles for pickup keywords.
+    Falls back to "In-Store Pickup" if no shipping lines present
+    (walk-in / POS orders typically have none).
+    """
+    shipping_lines = order.get("shipping_lines") or []
+    if not shipping_lines:
+        return "In-Store Pickup"
+
+    for line in shipping_lines:
+        title = (line.get("title") or "").lower()
+        code  = (line.get("code")  or "").lower()
+        pickup_keywords = ["pickup", "pick up", "pick-up", "collect", "in store", "in-store", "walk"]
+        if any(kw in title or kw in code for kw in pickup_keywords):
+            return "In-Store Pickup"
+
+    return "Shipping"
+
+
+# ──────────────────────────────────────────────
+# SHOPIFY — fetch orders updated in last 10 min
 # ──────────────────────────────────────────────
 def fetch_shopify_orders() -> list[dict]:
     since = (datetime.now(timezone.utc) - timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -88,10 +111,14 @@ def fetch_shopify_orders() -> list[dict]:
         "Content-Type": "application/json",
     }
     params = {
-        "status":        "any",
+        "status":         "any",
         "updated_at_min": since,
-        "limit":         250,
-        "fields":        "id,order_number,name,customer,line_items,created_at,financial_status",
+        "limit":          250,
+        "fields": (
+            "id,order_number,name,customer,line_items,"
+            "created_at,financial_status,"
+            "cancelled_at,cancel_reason,shipping_lines"
+        ),
     }
 
     all_orders = []
@@ -101,10 +128,9 @@ def fetch_shopify_orders() -> list[dict]:
         data = resp.json()
         all_orders.extend(data.get("orders", []))
 
-        # Handle Shopify cursor pagination via Link header
-        link = resp.headers.get("Link", "")
-        url  = None
-        params = {}   # clear params for subsequent pages (URL is already complete)
+        link   = resp.headers.get("Link", "")
+        url    = None
+        params = {}
         for part in link.split(","):
             if 'rel="next"' in part:
                 url = part.split(";")[0].strip().strip("<>")
@@ -115,7 +141,7 @@ def fetch_shopify_orders() -> list[dict]:
 
 
 # ──────────────────────────────────────────────
-# FIRESTORE  — init client from service-account JSON
+# FIRESTORE
 # ──────────────────────────────────────────────
 def get_firestore_client() -> firestore.Client:
     sa_info     = json.loads(SA_JSON)
@@ -126,71 +152,142 @@ def get_firestore_client() -> firestore.Client:
     return firestore.Client(project=FIREBASE_PROJECT_ID, credentials=credentials)
 
 
-def get_existing_shopify_ids(db: firestore.Client) -> set[str]:
-    """Return the set of shopifyOrderId values already in Firestore."""
-    docs = db.collection("orders").where("shopifyOrderId", "!=", "").stream()
-    return {d.get("shopifyOrderId") for d in docs if d.get("shopifyOrderId")}
+def get_existing_shopify_docs(db: firestore.Client) -> dict[str, tuple[str, dict]]:
+    """
+    Returns { shopifyOrderId: (firestoreDocId, docData) }
+    for every Firestore order that has a shopifyOrderId.
+    """
+    docs   = db.collection("orders").where("shopifyOrderId", "!=", "").stream()
+    result = {}
+    for d in docs:
+        data = d.to_dict()
+        sid  = data.get("shopifyOrderId")
+        if sid:
+            result[sid] = (d.id, data)
+    return result
 
 
 # ──────────────────────────────────────────────
 # MAIN
 # ──────────────────────────────────────────────
 def main():
-    db = get_firestore_client()
-    existing_ids = get_existing_shopify_ids(db)
-    log.info("Firestore already has %d Shopify-sourced orders", len(existing_ids))
+    db            = get_firestore_client()
+    existing_docs = get_existing_shopify_docs(db)
+    log.info("Firestore already has %d Shopify-sourced orders", len(existing_docs))
 
     raw_orders = fetch_shopify_orders()
-    added = 0
+    added = updated = cancelled_count = 0
 
     for order in raw_orders:
         shopify_id = str(order["id"])
+        line_items = order.get("line_items", [])
 
-        # Skip if already synced
-        if shopify_id in existing_ids:
-            continue
-
-        service = map_services(order.get("line_items", []))
+        service = map_services(line_items)
         if not service:
-            # Order has none of our target services — ignore
-            continue
+            continue  # not one of our services — ignore
 
-        # Build customer info
+        # ── Customer info ──────────────────────────────────────────
         customer   = order.get("customer") or {}
         first      = customer.get("first_name", "")
         last       = customer.get("last_name", "")
         name       = f"{first} {last}".strip() or "Unknown"
         phone      = (customer.get("phone") or "").strip()
-        order_name = order.get("name", "")   # e.g. "#1234" — Shopify display name
+        order_name = order.get("name", "")
 
-        # Detect express order
+        # ── Flags ──────────────────────────────────────────────────
         is_express = any(
             "express" in (item.get("title") or "").lower()
-            for item in order.get("line_items", [])
+            for item in line_items
         )
 
-        doc = {
-            "shopifyOrderId": shopify_id,
-            "shopifyOrderName": order_name,   # "#1234" — shown in app
-            "name":    name,
-            "phone":   phone,
-            "service": service,
-            "storeId": "",           # staff fills this in before first WA is sent
-            "status":  "pending",
-            "source":  "shopify",
-            "note":    "Express" if is_express else "",
-            "createdAt":   firestore.SERVER_TIMESTAMP,
-            "notifiedAt":  None,
-            "readyAt":     None,
-            "collectedAt": None,
+        fulfilment_type = map_fulfilment_type(order)
+
+        is_cancelled      = bool(order.get("cancelled_at"))
+        cancel_reason_raw = order.get("cancel_reason") or ""
+        cancel_reason_map = {
+            "customer":  "Cancelled by customer",
+            "fraud":     "Cancelled — suspected fraud",
+            "inventory": "Cancelled — out of stock",
+            "declined":  "Cancelled — payment declined",
+            "other":     "Cancelled",
         }
+        cancel_reason = cancel_reason_map.get(cancel_reason_raw, "Cancelled")
 
-        db.collection("orders").add(doc)
-        existing_ids.add(shopify_id)
-        added += 1
-        log.info("Added order %s (%s) — service: %s", shopify_id, order_name, service)
+        # Note field: Express and/or cancel reason
+        note_parts = []
+        if is_express:
+            note_parts.append("Express")
+        if is_cancelled:
+            note_parts.append(cancel_reason)
+        note = ", ".join(note_parts)
 
-    log.info("Sync complete. %d new order(s) added to Firestore.", added)
+        # ─────────────────────────────────────────────────────────
+        # UPSERT
+        # ─────────────────────────────────────────────────────────
+        if shopify_id in existing_docs:
+            # ── UPDATE ─────────────────────────────────────────────
+            fs_doc_id, fs_data = existing_docs[shopify_id]
+            ref     = db.collection("orders").document(fs_doc_id)
+            updates = {}
+
+            # Sync all Shopify-owned mutable fields
+            if fs_data.get("name")             != name:            updates["name"]             = name
+            if fs_data.get("phone")            != phone:           updates["phone"]            = phone
+            if fs_data.get("service")          != service:         updates["service"]          = service
+            if fs_data.get("shopifyOrderName") != order_name:      updates["shopifyOrderName"] = order_name
+            if fs_data.get("fulfilmentType")   != fulfilment_type: updates["fulfilmentType"]   = fulfilment_type
+            if fs_data.get("note")             != note:            updates["note"]             = note
+
+            # Cancellation — only transition once
+            if is_cancelled and fs_data.get("status") != "cancelled":
+                updates["status"]              = "cancelled"
+                updates["shopifyCancelReason"] = cancel_reason
+                updates["cancelledAt"]         = firestore.SERVER_TIMESTAMP
+                cancelled_count += 1
+                log.info("Cancelled order %s (%s) — reason: %s", shopify_id, order_name, cancel_reason)
+
+            if updates:
+                ref.update(updates)
+                updated += 1
+                log.info("Updated order %s (%s) — %s", shopify_id, order_name, list(updates.keys()))
+            else:
+                log.debug("No changes for order %s", shopify_id)
+
+        else:
+            # ── INSERT ─────────────────────────────────────────────
+            doc = {
+                "shopifyOrderId":   shopify_id,
+                "shopifyOrderName": order_name,
+                "name":             name,
+                "phone":            phone,
+                "service":          service,
+                "fulfilmentType":   fulfilment_type,
+                "storeId":          "",
+                "status":           "cancelled" if is_cancelled else "pending",
+                "source":           "shopify",
+                "note":             note,
+                "createdAt":        firestore.SERVER_TIMESTAMP,
+                "notifiedAt":       None,
+                "readyAt":          None,
+                "collectedAt":      None,
+            }
+            if is_cancelled:
+                doc["shopifyCancelReason"] = cancel_reason
+                doc["cancelledAt"]         = firestore.SERVER_TIMESTAMP
+
+            db.collection("orders").add(doc)
+            existing_docs[shopify_id] = ("", doc)
+            added += 1
+            log.info(
+                "Added order %s (%s) — service: %s | fulfilment: %s%s",
+                shopify_id, order_name, service, fulfilment_type,
+                " [CANCELLED]" if is_cancelled else "",
+            )
+
+    log.info(
+        "Sync complete. %d added, %d updated (%d cancellations).",
+        added, updated, cancelled_count,
+    )
 
 
 if __name__ == "__main__":
