@@ -152,7 +152,23 @@ def get_firestore_client() -> firestore.Client:
     return firestore.Client(project=FIREBASE_PROJECT_ID, credentials=credentials)
 
 
-def get_existing_shopify_docs(db: firestore.Client) -> dict[str, tuple[str, dict]]:
+def get_current_due_days(db: firestore.Client) -> int:
+    """
+    Read the most recent config/{YYYY-MM-DD} doc to get today's due days.
+    Falls back to 3 if no config exists.
+    """
+    try:
+        docs = (
+            db.collection("config")
+            .order_by("setAt", direction=firestore.Query.DESCENDING)
+            .limit(1)
+            .stream()
+        )
+        for d in docs:
+            return int(d.to_dict().get("days", 3))
+    except Exception as e:
+        log.warning("Could not read due days config: %s", e)
+    return 3
     """
     Returns { shopifyOrderId: (firestoreDocId, docData) }
     for every Firestore order that has a shopifyOrderId.
@@ -173,7 +189,8 @@ def get_existing_shopify_docs(db: firestore.Client) -> dict[str, tuple[str, dict
 def main():
     db            = get_firestore_client()
     existing_docs = get_existing_shopify_docs(db)
-    log.info("Firestore already has %d Shopify-sourced orders", len(existing_docs))
+    due_days      = get_current_due_days(db)
+    log.info("Firestore already has %d Shopify-sourced orders | due days: %d", len(existing_docs), due_days)
 
     raw_orders = fetch_shopify_orders()
     added = updated = cancelled_count = 0
@@ -266,6 +283,7 @@ def main():
                 "status":           "cancelled" if is_cancelled else "pending",
                 "source":           "shopify",
                 "note":             note,
+                "dueDays":          due_days,
                 "createdAt":        firestore.SERVER_TIMESTAMP,
                 "notifiedAt":       None,
                 "readyAt":          None,
