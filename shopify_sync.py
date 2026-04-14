@@ -79,25 +79,57 @@ def map_services(line_items: list[dict]) -> str | None:
 # ──────────────────────────────────────────────
 # DELIVERY METHOD
 # ──────────────────────────────────────────────
-def map_fulfilment_type(order: dict) -> str:
+def map_fulfilment_type(order: dict) -> tuple[str, str]:
     """
-    Determine if the order is for shipping or in-store pickup.
-    Checks shipping_lines titles for pickup keywords.
-    Falls back to "In-Store Pickup" if no shipping lines present
-    (walk-in / POS orders typically have none).
+    Returns (fulfilmentType, carrierName).
+
+    Shipping carriers (→ "Shipping"):
+      - J&T Express  (j&t, jnt, j and t)
+      - PosLaju      (poslaju, pos laju, pos malaysia)
+      - TikTok Shop  (tiktok, tik tok)
+      - DHL, GDEX, Ninja, SkyNet, CityLink
+      - Any unrecognised shipping line
+
+    In-Store Pickup (→ "In-Store Pickup"):
+      - Title/code contains pickup/in-store/collect keywords
+      - No shipping lines at all (walk-in / POS order)
     """
     shipping_lines = order.get("shipping_lines") or []
     if not shipping_lines:
-        return "In-Store Pickup"
+        return "In-Store Pickup", ""
+
+    PICKUP_KEYWORDS = ["pickup", "pick up", "pick-up", "in store", "in-store",
+                       "collect", "walk in", "walkin", "layan diri"]
+
+    # Map of keyword → display name
+    CARRIER_MAP = [
+        (["j&t", "jnt", "j and t"],                          "J&T Express"),
+        (["poslaju", "pos laju", "pos malaysia"],             "PosLaju"),
+        (["tiktok", "tik tok", "tiktok shop"],               "TikTok"),
+        (["dhl"],                                             "DHL"),
+        (["gdex"],                                            "GDEX"),
+        (["ninja"],                                           "Ninja Van"),
+        (["skynet"],                                          "SkyNet"),
+        (["citylink", "city-link"],                           "CityLink"),
+    ]
 
     for line in shipping_lines:
-        title = (line.get("title") or "").lower()
-        code  = (line.get("code")  or "").lower()
-        pickup_keywords = ["pickup", "pick up", "pick-up", "collect", "in store", "in-store", "walk"]
-        if any(kw in title or kw in code for kw in pickup_keywords):
-            return "In-Store Pickup"
+        title    = (line.get("title") or "").lower()
+        code     = (line.get("code")  or "").lower()
+        combined = title + " " + code
 
-    return "Shipping"
+        # Explicit pickup keyword → in-store
+        if any(kw in combined for kw in PICKUP_KEYWORDS):
+            return "In-Store Pickup", ""
+
+        # Match known carrier
+        for keywords, display_name in CARRIER_MAP:
+            if any(kw in combined for kw in keywords):
+                return "Shipping", display_name
+
+    # Has shipping lines but no match — use raw title as carrier name
+    raw_title = (shipping_lines[0].get("title") or "").strip()
+    return "Shipping", raw_title
 
 
 # ──────────────────────────────────────────────
@@ -169,6 +201,9 @@ def get_current_due_days(db: firestore.Client) -> int:
     except Exception as e:
         log.warning("Could not read due days config: %s", e)
     return 3
+
+
+def get_existing_shopify_docs(db: firestore.Client) -> dict[str, tuple[str, dict]]:
     """
     Returns { shopifyOrderId: (firestoreDocId, docData) }
     for every Firestore order that has a shopifyOrderId.
@@ -205,9 +240,11 @@ def main():
 
         # ── Customer info ──────────────────────────────────────────
         customer   = order.get("customer") or {}
-        first      = customer.get("first_name", "")
-        last       = customer.get("last_name", "")
-        name       = f"{first} {last}".strip() or "Unknown"
+        first      = (customer.get("first_name") or "").strip()
+        last       = (customer.get("last_name")  or "").strip()
+        # Filter out "None" string that some integrations produce
+        name_parts = [p for p in [first, last] if p and p.lower() != "none"]
+        name       = " ".join(name_parts) or "Unknown"
         phone      = (customer.get("phone") or "").strip()
         order_name = order.get("name", "")
 
@@ -217,7 +254,7 @@ def main():
             for item in line_items
         )
 
-        fulfilment_type = map_fulfilment_type(order)
+        fulfilment_type, carrier_name = map_fulfilment_type(order)
 
         is_cancelled      = bool(order.get("cancelled_at"))
         cancel_reason_raw = order.get("cancel_reason") or ""
@@ -253,6 +290,7 @@ def main():
             if fs_data.get("service")          != service:         updates["service"]          = service
             if fs_data.get("shopifyOrderName") != order_name:      updates["shopifyOrderName"] = order_name
             if fs_data.get("fulfilmentType")   != fulfilment_type: updates["fulfilmentType"]   = fulfilment_type
+            if fs_data.get("carrierName")      != carrier_name:    updates["carrierName"]      = carrier_name
             if fs_data.get("note")             != note:            updates["note"]             = note
 
             # Cancellation — only transition once
@@ -279,6 +317,7 @@ def main():
                 "phone":            phone,
                 "service":          service,
                 "fulfilmentType":   fulfilment_type,
+                "carrierName":      carrier_name,
                 "storeId":          "",
                 "status":           "cancelled" if is_cancelled else "pending",
                 "source":           "shopify",
@@ -297,8 +336,9 @@ def main():
             existing_docs[shopify_id] = ("", doc)
             added += 1
             log.info(
-                "Added order %s (%s) — service: %s | fulfilment: %s%s",
+                "Added order %s (%s) — service: %s | fulfilment: %s%s%s",
                 shopify_id, order_name, service, fulfilment_type,
+                f" [{carrier_name}]" if carrier_name else "",
                 " [CANCELLED]" if is_cancelled else "",
             )
 
