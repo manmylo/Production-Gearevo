@@ -92,25 +92,34 @@ def map_fulfilment_type(order: dict) -> tuple[str, str]:
 
     In-Store Pickup (→ "In-Store Pickup"):
       - Title/code contains pickup/in-store/collect keywords
+      - Shopify's standard local pickup codes/titles
+      - GEAREVO (Adiat Resources) — this store's Shopify pickup method name
       - No shipping lines at all (walk-in / POS order)
     """
     shipping_lines = order.get("shipping_lines") or []
     if not shipping_lines:
         return "In-Store Pickup", ""
 
-    PICKUP_KEYWORDS = ["pickup", "pick up", "pick-up", "in store", "in-store",
-                       "collect", "walk in", "walkin", "layan diri"]
+    PICKUP_KEYWORDS = [
+        # Generic pickup words
+        "pickup", "pick up", "pick-up", "in store", "in-store",
+        "collect", "walk in", "walkin", "layan diri",
+        # Shopify standard local pickup identifiers
+        "local pickup", "local_pickup", "shopify-local-pickup",
+        # This store's specific pickup shipping line title
+        "gearevo", "adiat",
+    ]
 
     # Map of keyword → display name
     CARRIER_MAP = [
-        (["j&t", "jnt", "j and t"],                          "J&T Express"),
-        (["poslaju", "pos laju", "pos malaysia"],             "PosLaju"),
-        (["tiktok", "tik tok", "tiktok shop"],               "TikTok"),
-        (["dhl"],                                             "DHL"),
-        (["gdex"],                                            "GDEX"),
-        (["ninja"],                                           "Ninja Van"),
-        (["skynet"],                                          "SkyNet"),
-        (["citylink", "city-link"],                           "CityLink"),
+        (["j&t", "jnt", "j and t"],                "J&T Express"),
+        (["poslaju", "pos laju", "pos malaysia"],   "PosLaju"),
+        (["tiktok", "tik tok", "tiktok shop"],      "TikTok"),
+        (["dhl"],                                   "DHL"),
+        (["gdex"],                                  "GDEX"),
+        (["ninja"],                                 "Ninja Van"),
+        (["skynet"],                                "SkyNet"),
+        (["citylink", "city-link"],                 "CityLink"),
     ]
 
     for line in shipping_lines:
@@ -118,16 +127,16 @@ def map_fulfilment_type(order: dict) -> tuple[str, str]:
         code     = (line.get("code")  or "").lower()
         combined = title + " " + code
 
-        # Explicit pickup keyword → in-store
+        # Pickup keyword takes priority — check before carrier map
         if any(kw in combined for kw in PICKUP_KEYWORDS):
             return "In-Store Pickup", ""
 
-        # Match known carrier
+        # Match known shipping carrier
         for keywords, display_name in CARRIER_MAP:
             if any(kw in combined for kw in keywords):
                 return "Shipping", display_name
 
-    # Has shipping lines but no match — use raw title as carrier name
+    # Has shipping lines but no keyword matched — use raw title as carrier name
     raw_title = (shipping_lines[0].get("title") or "").strip()
     return "Shipping", raw_title
 
