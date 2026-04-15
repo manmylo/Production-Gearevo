@@ -172,13 +172,13 @@ def map_fulfilment_type(order: dict) -> tuple[str, str]:
 # ──────────────────────────────────────────────
 def is_auto_collect(service: str, note: str) -> bool:
     """
-    Express orders and any Engraving service are done on-the-spot —
+    Express orders and pure Engraving-only orders are done on-the-spot —
     no workflow tracking needed. Mark them collected immediately.
-    Covers: Express flag, Engraving, Sharpening + Engraving,
-    Kydex + Engraving, Sharpening + Kydex + Engraving.
+    Combo services (Sharpening + Engraving, Kydex + Engraving, etc.)
+    still need full workflow tracking.
     """
     is_express = "express" in (note or "").lower()
-    is_engrave = "engrav"  in (service or "").lower()
+    is_engrave = (service or "").strip().lower() == "engraving"
     return is_express or is_engrave
 
 
