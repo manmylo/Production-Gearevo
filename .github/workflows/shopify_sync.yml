@@ -2,6 +2,15 @@ name: Shopify → Firestore Sync
 
 on:
   workflow_dispatch:
+    inputs:
+      hours:
+        description: 'Hours to look back (default: uses SYNC_LOOKBACK_MINUTES env, or 10 min)'
+        required: false
+        type: string
+        default: ''
+
+  repository_dispatch:
+    types: [shopify-sync]
 
 jobs:
   sync:
@@ -34,4 +43,5 @@ jobs:
           SHOPIFY_ACCESS_TOKEN: ${{ secrets.SHOPIFY_ACCESS_TOKEN }}
           FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
           FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+          SYNC_LOOKBACK_HOURS: ${{ github.event.inputs.hours || github.event.client_payload.hours || '' }}
         run: python shopify_sync.py
