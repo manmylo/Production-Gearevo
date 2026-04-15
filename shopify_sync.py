@@ -14,6 +14,10 @@ New/updated behaviour:
   - Delivery method  → fulfilmentType: "Shipping" | "In-Store Pickup"
   - EXPRESS / ENGRAVING orders → auto-collected on insert (no workflow
                        tracking needed — short turnaround tasks)
+
+Lookback window:
+  - Default: 10 minutes (for regular cron sync every 5-10 min)
+  - Set SYNC_LOOKBACK_HOURS env var for backfill (e.g. "24" = last 24h)
 """
 
 import os
@@ -34,6 +38,26 @@ SHOPIFY_STORE_URL    = os.environ["SHOPIFY_STORE_URL"]
 SHOPIFY_ACCESS_TOKEN = os.environ["SHOPIFY_ACCESS_TOKEN"]
 FIREBASE_PROJECT_ID  = os.environ["FIREBASE_PROJECT_ID"]
 SA_JSON              = os.environ["FIREBASE_SERVICE_ACCOUNT_JSON"]
+
+# ──────────────────────────────────────────────
+# LOOKBACK WINDOW
+# ──────────────────────────────────────────────
+def get_lookback_minutes() -> int:
+    """
+    Returns the lookback window in minutes.
+    - If SYNC_LOOKBACK_HOURS is set and non-empty → use that (converted to minutes)
+    - Otherwise default to 10 minutes (normal cron interval)
+    """
+    hours_str = os.environ.get("SYNC_LOOKBACK_HOURS", "").strip()
+    if hours_str:
+        try:
+            hours = float(hours_str)
+            minutes = int(hours * 60)
+            log.info("Backfill mode: looking back %s hours (%d minutes)", hours_str, minutes)
+            return max(minutes, 1)
+        except ValueError:
+            log.warning("Invalid SYNC_LOOKBACK_HOURS value '%s', using default 10 min", hours_str)
+    return 10
 
 # ──────────────────────────────────────────────
 # SERVICE MAPPING  (Shopify line item → app label)
@@ -159,10 +183,10 @@ def is_auto_collect(service: str, note: str) -> bool:
 
 
 # ──────────────────────────────────────────────
-# SHOPIFY — fetch orders updated in last 10 min
+# SHOPIFY — fetch orders updated in lookback window
 # ──────────────────────────────────────────────
-def fetch_shopify_orders() -> list[dict]:
-    since = (datetime.now(timezone.utc) - timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+def fetch_shopify_orders(lookback_minutes: int) -> list[dict]:
+    since = (datetime.now(timezone.utc) - timedelta(minutes=lookback_minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
     url   = f"https://{SHOPIFY_STORE_URL}/admin/api/2024-01/orders.json"
     headers = {
         "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN,
@@ -194,7 +218,7 @@ def fetch_shopify_orders() -> list[dict]:
                 url = part.split(";")[0].strip().strip("<>")
                 break
 
-    log.info("Fetched %d orders from Shopify (updated since %s)", len(all_orders), since)
+    log.info("Fetched %d orders from Shopify (updated since %s, lookback %d min)", len(all_orders), since, lookback_minutes)
     return all_orders
 
 
@@ -274,10 +298,11 @@ def get_relevant_shopify_docs(
 # MAIN
 # ──────────────────────────────────────────────
 def main():
+    lookback_minutes = get_lookback_minutes()
     db       = get_firestore_client()
     due_days = get_current_due_days(db)
 
-    raw_orders = fetch_shopify_orders()
+    raw_orders = fetch_shopify_orders(lookback_minutes)
 
     # Extract IDs for orders that match our services — these are the only ones
     # we'll ever read or write, so no point querying Firestore for others
