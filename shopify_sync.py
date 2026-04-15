@@ -337,6 +337,13 @@ def main():
         phone      = (customer.get("phone") or "").strip()
         order_name = order.get("name", "")
 
+        # ── Shopify order creation date (actual order date, not sync time) ──
+        shopify_created_at_str = order.get("created_at", "")
+        if shopify_created_at_str:
+            shopify_created_at = datetime.fromisoformat(shopify_created_at_str.replace("Z", "+00:00"))
+        else:
+            shopify_created_at = datetime.now(timezone.utc)
+
         # ── Flags ──────────────────────────────────────────────────
         is_express = any(
             "express" in (item.get("title") or "").lower()
@@ -381,6 +388,15 @@ def main():
             if fs_data.get("fulfilmentType")   != fulfilment_type: updates["fulfilmentType"]   = fulfilment_type
             if fs_data.get("carrierName")      != carrier_name:    updates["carrierName"]      = carrier_name
             if fs_data.get("note")             != note:            updates["note"]             = note
+
+            # Sync createdAt to Shopify's actual order creation date
+            existing_created = fs_data.get("createdAt")
+            if existing_created and hasattr(existing_created, 'timestamp'):
+                # Compare timestamps — if they differ by more than 60s, update
+                if abs(existing_created.timestamp() - shopify_created_at.timestamp()) > 60:
+                    updates["createdAt"] = shopify_created_at
+            elif not existing_created:
+                updates["createdAt"] = shopify_created_at
 
             # Cancellation — only transition once
             if is_cancelled and fs_data.get("status") != "cancelled":
@@ -430,7 +446,7 @@ def main():
                 "source":           "shopify",
                 "note":             note,
                 "dueDays":          due_days,
-                "createdAt":        firestore.SERVER_TIMESTAMP,
+                "createdAt":        shopify_created_at,
                 "notifiedAt":       None,
                 "readyAt":          None,
                 "collectedAt":      firestore.SERVER_TIMESTAMP if auto_collect else None,
