@@ -102,6 +102,63 @@ def map_services(line_items: list[dict]) -> str | None:
     return " + ".join(found)
 
 
+def extract_service_line_items(line_items: list[dict]) -> tuple[list[dict], float, int]:
+    """
+    Returns (matched_items, total_sales, total_quantity) for line items that match
+    one of our tracked services.
+
+    Each matched_item is:
+        {
+          "title":    str,          # original Shopify product title
+          "service":  str,          # mapped app label (Sharpening/Engraving/Kydex Sheath)
+          "quantity": int,
+          "price":    float,        # per-unit price
+          "subtotal": float,        # price * quantity (before discounts)
+        }
+
+    Sales are computed from Shopify's `price` field (in store currency, e.g. RM).
+    """
+    matched: list[dict] = []
+    total_sales = 0.0
+    total_qty   = 0
+
+    for item in line_items:
+        title = (item.get("title") or "").lower()
+
+        # Find the mapped service label (first keyword match wins)
+        label = None
+        for keyword, mapped in SERVICE_KEYWORDS.items():
+            if keyword in title:
+                label = mapped
+                break
+        if not label:
+            continue
+
+        try:
+            qty = int(item.get("quantity") or 0)
+        except (TypeError, ValueError):
+            qty = 0
+
+        try:
+            price = float(item.get("price") or 0)
+        except (TypeError, ValueError):
+            price = 0.0
+
+        subtotal = round(price * qty, 2)
+
+        matched.append({
+            "title":    item.get("title") or "",
+            "service":  label,
+            "quantity": qty,
+            "price":    price,
+            "subtotal": subtotal,
+        })
+        total_sales += subtotal
+        total_qty   += qty
+
+    return matched, round(total_sales, 2), total_qty
+
+
 # ──────────────────────────────────────────────
 # DELIVERY METHOD
 # ──────────────────────────────────────────────
@@ -365,6 +422,9 @@ def main():
         if not service:
             continue  # not one of our services — ignore
 
+        # ── Extract line item details (for reporting: qty, sales) ──
+        matched_items, total_sales, total_qty = extract_service_line_items(line_items)
+
         # ── Customer info ──────────────────────────────────────────
         customer   = order.get("customer") or {}
         first      = (customer.get("first_name") or "").strip()
@@ -442,6 +502,11 @@ def main():
             if fs_data.get("carrierName")      != carrier_name:    updates["carrierName"]      = carrier_name
             if fs_data.get("note")             != note:            updates["note"]             = note
 
+            # Sync reporting fields (line items, totals) — always refresh so edits on Shopify propagate
+            if fs_data.get("lineItems")   != matched_items: updates["lineItems"]   = matched_items
+            if fs_data.get("totalSales")  != total_sales:   updates["totalSales"]  = total_sales
+            if fs_data.get("totalQty")    != total_qty:     updates["totalQty"]    = total_qty
+
             # Sync createdAt to Shopify's actual order creation date
             existing_created = fs_data.get("createdAt")
             if existing_created and hasattr(existing_created, 'timestamp'):
@@ -492,6 +557,9 @@ def main():
                 "name":             name,
                 "phone":            phone,
                 "service":          service,
+                "lineItems":        matched_items,
+                "totalSales":       total_sales,
+                "totalQty":         total_qty,
                 "fulfilmentType":   fulfilment_type,
                 "carrierName":      carrier_name,
                 "storeId":          "",
