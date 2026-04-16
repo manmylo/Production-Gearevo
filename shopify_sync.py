@@ -109,62 +109,86 @@ def map_fulfilment_type(order: dict) -> tuple[str, str]:
     """
     Returns (fulfilmentType, carrierName).
 
-    Shipping carriers (→ "Shipping"):
-      - J&T Express  (j&t, jnt, j and t)
-      - PosLaju      (poslaju, pos laju, pos malaysia)
-      - TikTok Shop  (tiktok, tik tok)
-      - DHL, GDEX, Ninja, SkyNet, CityLink
-      - Any unrecognised shipping line
+    The store's configured delivery methods in Shopify are:
+      1. "In store"              → In-Store Pickup
+      2. "Shipping"              → Shipping (generic)
+      3. "TikTok"                → Shipping (TikTok)
+      4. "PosLaju"               → Shipping (PosLaju)
+      5. "J&T (Peninsular only)" → Shipping (J&T Express)
 
-    In-Store Pickup (→ "In-Store Pickup"):
-      - Title/code contains pickup/in-store/collect keywords
-      - Shopify's standard local pickup codes/titles
-      - GEAREVO (Adiat Resources) — this store's Shopify pickup method name
-      - No shipping lines at all (walk-in / POS order)
+    Additional detection:
+      - TikTok Shop orders sometimes arrive WITHOUT shipping_lines because
+        TikTok handles fulfilment on their side. We detect these via
+        order.source_name containing "tiktok" (or similar marketplace
+        indicators) and classify them as Shipping/TikTok.
+      - Orders with no shipping_lines AND no marketplace source → In-Store
+        Pickup (genuine walk-in / POS orders).
     """
     shipping_lines = order.get("shipping_lines") or []
-    if not shipping_lines:
-        return "In-Store Pickup", ""
+    source_name    = (order.get("source_name") or "").lower()
 
-    PICKUP_KEYWORDS = [
-        # Generic pickup words
-        "pickup", "pick up", "pick-up", "in store", "in-store",
-        "collect", "walk in", "walkin", "layan diri",
-        # Shopify standard local pickup identifiers
-        "local pickup", "local_pickup", "shopify-local-pickup",
-        # This store's specific pickup shipping line title
-        "gearevo", "adiat",
+    # ── Step 1: If shipping_lines is present, use it (authoritative) ──
+    if shipping_lines:
+        PICKUP_KEYWORDS = [
+            # Explicit in-store / pickup wording
+            "in store", "in-store", "instore",
+            "pickup", "pick up", "pick-up",
+            "collect", "walk in", "walkin", "layan diri",
+            # Shopify standard local pickup identifiers
+            "local pickup", "local_pickup", "shopify-local-pickup",
+            # This store's specific pickup shipping line title
+            "gearevo", "adiat",
+        ]
+
+        # Ordered carrier keywords — first match wins.
+        # J&T comes first so "J&T (Peninsular only)" matches cleanly.
+        CARRIER_MAP = [
+            (["j&t", "jnt", "j and t"],                 "J&T Express"),
+            (["poslaju", "pos laju", "pos malaysia"],    "PosLaju"),
+            (["tiktok", "tik tok", "tiktok shop"],       "TikTok"),
+            (["dhl"],                                    "DHL"),
+            (["gdex"],                                   "GDEX"),
+            (["ninja"],                                  "Ninja Van"),
+            (["skynet"],                                 "SkyNet"),
+            (["citylink", "city-link"],                  "CityLink"),
+        ]
+
+        for line in shipping_lines:
+            title    = (line.get("title")  or "").lower()
+            code     = (line.get("code")   or "").lower()
+            source   = (line.get("source") or "").lower()
+            combined = f"{title} {code} {source}"
+
+            # Pickup keyword takes priority — check before carrier map
+            if any(kw in combined for kw in PICKUP_KEYWORDS):
+                return "In-Store Pickup", ""
+
+            # Match known shipping carrier
+            for keywords, display_name in CARRIER_MAP:
+                if any(kw in combined for kw in keywords):
+                    return "Shipping", display_name
+
+        # Has shipping lines but no keyword matched — fall through to raw title.
+        # The literal delivery method "Shipping" (one of the store's 5 methods)
+        # lands here and gets "Shipping" as its carrier display name, which is fine.
+        raw_title = (shipping_lines[0].get("title") or "").strip() or "Shipping"
+        return "Shipping", raw_title
+
+    # ── Step 2: No shipping_lines. Check marketplace/source signals. ──
+    # TikTok Shop orders often arrive with source_name containing "tiktok"
+    # (e.g. "tiktok", "tiktok_shop") and no shipping lines because fulfilment
+    # is handled on TikTok's side.
+    MARKETPLACE_SOURCES = [
+        (["tiktok", "tik_tok"], "TikTok"),
+        (["shopee"],            "Shopee"),
+        (["lazada"],            "Lazada"),
     ]
+    for keywords, display_name in MARKETPLACE_SOURCES:
+        if any(kw in source_name for kw in keywords):
+            return "Shipping", display_name
 
-    # Map of keyword → display name
-    CARRIER_MAP = [
-        (["j&t", "jnt", "j and t"],                "J&T Express"),
-        (["poslaju", "pos laju", "pos malaysia"],   "PosLaju"),
-        (["tiktok", "tik tok", "tiktok shop"],      "TikTok"),
-        (["dhl"],                                   "DHL"),
-        (["gdex"],                                  "GDEX"),
-        (["ninja"],                                 "Ninja Van"),
-        (["skynet"],                                "SkyNet"),
-        (["citylink", "city-link"],                 "CityLink"),
-    ]
-
-    for line in shipping_lines:
-        title    = (line.get("title") or "").lower()
-        code     = (line.get("code")  or "").lower()
-        combined = title + " " + code
-
-        # Pickup keyword takes priority — check before carrier map
-        if any(kw in combined for kw in PICKUP_KEYWORDS):
-            return "In-Store Pickup", ""
-
-        # Match known shipping carrier
-        for keywords, display_name in CARRIER_MAP:
-            if any(kw in combined for kw in keywords):
-                return "Shipping", display_name
-
-    # Has shipping lines but no keyword matched — use raw title as carrier name
-    raw_title = (shipping_lines[0].get("title") or "").strip()
-    return "Shipping", raw_title
+    # ── Step 3: No shipping lines, no marketplace source → genuine walk-in ──
+    return "In-Store Pickup", ""
 
 
 # ──────────────────────────────────────────────
@@ -196,10 +220,13 @@ def fetch_shopify_orders(lookback_minutes: int) -> list[dict]:
         "status":         "any",
         "updated_at_min": since,
         "limit":          250,
+        # source_name and tags help detect TikTok/marketplace orders that
+        # arrive without shipping_lines (handled by map_fulfilment_type).
         "fields": (
             "id,order_number,name,customer,line_items,"
             "created_at,financial_status,"
-            "cancelled_at,cancel_reason,shipping_lines"
+            "cancelled_at,cancel_reason,shipping_lines,"
+            "source_name,tags"
         ),
     }
 
@@ -351,6 +378,19 @@ def main():
         )
 
         fulfilment_type, carrier_name = map_fulfilment_type(order)
+
+        # Diagnostic log — helps debug future misclassifications.
+        # Shows what Shopify actually sent so we can tell at a glance whether
+        # shipping_lines was empty, what source_name was, etc.
+        shipping_titles = [
+            (sl.get("title") or sl.get("code") or "").strip()
+            for sl in (order.get("shipping_lines") or [])
+        ]
+        log.info(
+            "Fulfilment for %s (%s): type=%s carrier=%s | shipping_lines=%s | source_name=%s",
+            shopify_id, order_name, fulfilment_type, carrier_name or "—",
+            shipping_titles or "[]", order.get("source_name") or "—",
+        )
 
         is_cancelled      = bool(order.get("cancelled_at"))
         cancel_reason_raw = order.get("cancel_reason") or ""
