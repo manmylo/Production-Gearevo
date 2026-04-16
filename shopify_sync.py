@@ -174,8 +174,8 @@ def map_fulfilment_type(order: dict) -> tuple[str, str]:
         raw_title = (shipping_lines[0].get("title") or "").strip() or "Shipping"
         return "Shipping", raw_title
 
-    # ── Step 2: No shipping_lines. Check marketplace/source signals. ──
-    # TikTok Shop orders often arrive with source_name containing "tiktok"
+    # ── Step 2: No shipping_lines. Check marketplace/source signals first. ──
+    # TikTok Shop orders sometimes arrive with source_name containing "tiktok"
     # (e.g. "tiktok", "tiktok_shop") and no shipping lines because fulfilment
     # is handled on TikTok's side.
     MARKETPLACE_SOURCES = [
@@ -187,7 +187,18 @@ def map_fulfilment_type(order: dict) -> tuple[str, str]:
         if any(kw in source_name for kw in keywords):
             return "Shipping", display_name
 
-    # ── Step 3: No shipping lines, no marketplace source → genuine walk-in ──
+    # ── Step 3: Draft orders (source_name="shopify_draft_order") or any other
+    # order with no shipping line. The decisive signal is whether the customer
+    # has a shipping address attached. If yes → it's a shipping order (the staff
+    # just didn't attach a shipping line fee in the draft). If no → genuine
+    # walk-in / in-store pickup.
+    shipping_address = order.get("shipping_address")
+    if shipping_address and isinstance(shipping_address, dict):
+        # Has a shipping address → customer intends it to be shipped.
+        # We don't know which carrier, so label it generically as "Shipping".
+        return "Shipping", "Shipping"
+
+    # ── Step 4: No shipping lines, no marketplace, no shipping address → walk-in ──
     return "In-Store Pickup", ""
 
 
@@ -220,13 +231,13 @@ def fetch_shopify_orders(lookback_minutes: int) -> list[dict]:
         "status":         "any",
         "updated_at_min": since,
         "limit":          250,
-        # source_name and tags help detect TikTok/marketplace orders that
-        # arrive without shipping_lines (handled by map_fulfilment_type).
+        # source_name, tags, and shipping_address help classify orders that
+        # arrive without shipping_lines (draft orders, TikTok/marketplace, etc.)
         "fields": (
             "id,order_number,name,customer,line_items,"
             "created_at,financial_status,"
             "cancelled_at,cancel_reason,shipping_lines,"
-            "source_name,tags"
+            "source_name,tags,shipping_address"
         ),
     }
 
@@ -386,10 +397,12 @@ def main():
             (sl.get("title") or sl.get("code") or "").strip()
             for sl in (order.get("shipping_lines") or [])
         ]
+        has_ship_addr = bool(order.get("shipping_address"))
         log.info(
-            "Fulfilment for %s (%s): type=%s carrier=%s | shipping_lines=%s | source_name=%s",
+            "Fulfilment for %s (%s): type=%s carrier=%s | shipping_lines=%s | source_name=%s | has_shipping_address=%s",
             shopify_id, order_name, fulfilment_type, carrier_name or "—",
             shipping_titles or "[]", order.get("source_name") or "—",
+            has_ship_addr,
         )
 
         is_cancelled      = bool(order.get("cancelled_at"))
