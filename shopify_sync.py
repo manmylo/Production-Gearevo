@@ -1,29 +1,43 @@
 """
 shopify_sync.py
 ---------------
-Fetches recent Shopify orders, filters for Layo services
-(Servis Asahan, Gearevo Kydex, Laser Engraving), maps them
-to app service labels, and upserts to Firestore.
+Fetches recent Shopify orders, filters for items whose SKU is in our
+service mapping (sku_services.csv), maps them to app service labels,
+and upserts to Firestore.
 
-New/updated behaviour:
-  - NEW orders    → inserted as before
-  - EDITED orders → mutable fields (name, phone, service, note,
-                    fulfilmentType) are patched in Firestore
-  - CANCELLED orders → status set to "cancelled", shopifyCancelReason
-                       added, storeId requirement bypassed
-  - Delivery method  → fulfilmentType: "Shipping" | "In-Store Pickup"
-  - EXPRESS / ENGRAVING orders → auto-collected on insert (no workflow
-                       tracking needed — short turnaround tasks)
+What changed vs. the keyword-based version:
+  - SKU-based matching: an order is relevant if any line item's SKU
+    appears in sku_services.csv. The CSV is the single source of truth
+    for what counts as a service order. Edit + push to update.
+  - Store ID auto-fill: a line item with SKU 'GE-OID-N' (1 <= N <= 100)
+    sets `storeId` to N on the Firestore doc. The webapp uses this to
+    decide between prompting WhatsApp send-out (storeId set) vs.
+    prompting staff to fill it in (storeId blank). If multiple distinct
+    OIDs appear in one order, the first wins and a warning is logged.
+  - Existing manually-entered storeIds are NEVER overwritten with
+    blank — anything filled in via the webapp survives later syncs.
+
+Other behaviour (unchanged):
+  - NEW orders        -> inserted
+  - EDITED orders     -> mutable fields patched (name, phone, service,
+                          note, fulfilmentType, storeId-from-OID)
+  - CANCELLED orders  -> status 'cancelled', shopifyCancelReason added,
+                          storeId requirement bypassed
+  - Delivery method   -> fulfilmentType: 'Shipping' | 'In-Store Pickup'
+  - EXPRESS / pure-Engraving orders -> auto-collected on insert
 
 Lookback window:
-  - Default: 10 minutes (for regular cron sync every 5-10 min)
-  - Set SYNC_LOOKBACK_HOURS env var for backfill (e.g. "24" = last 24h)
+  - Default: 10 minutes (regular cron sync)
+  - Set SYNC_LOOKBACK_HOURS env var for backfill (e.g. '24' = last 24h)
 """
 
 import os
+import re
+import csv
 import json
 import logging
 import requests
+from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from google.cloud import firestore
 from google.oauth2 import service_account
@@ -39,13 +53,14 @@ SHOPIFY_ACCESS_TOKEN = os.environ["SHOPIFY_ACCESS_TOKEN"]
 FIREBASE_PROJECT_ID  = os.environ["FIREBASE_PROJECT_ID"]
 SA_JSON              = os.environ["FIREBASE_SERVICE_ACCOUNT_JSON"]
 
+
 # ──────────────────────────────────────────────
 # LOOKBACK WINDOW
 # ──────────────────────────────────────────────
 def get_lookback_minutes() -> int:
     """
     Returns the lookback window in minutes.
-    - If SYNC_LOOKBACK_HOURS is set and non-empty → use that (converted to minutes)
+    - If SYNC_LOOKBACK_HOURS is set and non-empty -> use that (converted to minutes)
     - Otherwise default to 10 minutes (normal cron interval)
     """
     hours_str = os.environ.get("SYNC_LOOKBACK_HOURS", "").strip()
@@ -59,23 +74,114 @@ def get_lookback_minutes() -> int:
             log.warning("Invalid SYNC_LOOKBACK_HOURS value '%s', using default 10 min", hours_str)
     return 10
 
+
 # ──────────────────────────────────────────────
-# SERVICE MAPPING  (Shopify line item → app label)
+# SKU → SERVICE MAPPING (loaded from sku_services.csv)
 # ──────────────────────────────────────────────
-SERVICE_KEYWORDS = {
-    "servis asah pisau": "Sharpening",
-    "gearevo kydex":     "Kydex Sheath",
-    "laser engraving":   "Engraving",
+# CSV format (in repo root, alongside this script):
+#   product_name,sku,service
+#   Knife Sharpening - Standard,SK-001,Sharpening
+#   Custom Kydex Sheath,KX-001,Kydex Sheath
+#   Laser Engraving - 1 Line,EN-001,Engraving
+#
+# `service` is normalized to one of: Sharpening, Kydex Sheath, Engraving
+# (the combo-label logic below depends on these exact strings). The CSV
+# can use any of the tolerated aliases below — e.g. the Excel sheet uses
+# "Kydex" which gets normalized to the canonical "Kydex Sheath".
+#
+# `product_name` is informational only — kept so the CSV mirrors the
+# Excel sheet 1:1 and is easy for the team to maintain.
+#
+# Do NOT add GE-OID-N entries here — those are store-ID markers, not
+# services. They're handled separately by extract_store_id().
+SKU_MAP_PATH = Path(__file__).parent / "sku_services.csv"
+
+# Map any tolerated CSV value (lowercased) -> canonical service label.
+SERVICE_NORMALIZE = {
+    "sharpening":      "Sharpening",
+    "sharpen":         "Sharpening",
+    "kydex":           "Kydex Sheath",
+    "kydex sheath":    "Kydex Sheath",
+    "engraving":       "Engraving",
+    "laser engraving": "Engraving",
 }
 
 
-def map_services(line_items: list[dict]) -> str | None:
-    found = []
+def load_sku_services() -> dict[str, str]:
+    """Load SKU -> service map from CSV. Keys lowercased for case-insensitive lookup."""
+    mapping: dict[str, str] = {}
+    if not SKU_MAP_PATH.exists():
+        log.error("SKU mapping file not found at %s — no orders will match!", SKU_MAP_PATH)
+        return mapping
+    with open(SKU_MAP_PATH, newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            sku = (row.get("sku") or "").strip()
+            raw_service = (row.get("service") or "").strip()
+            if not sku or not raw_service:
+                continue
+            canonical = SERVICE_NORMALIZE.get(raw_service.lower())
+            if not canonical:
+                log.warning(
+                    "SKU '%s' has unknown service '%s' — skipping (accepted: %s)",
+                    sku, raw_service, sorted(set(SERVICE_NORMALIZE.values())),
+                )
+                continue
+            mapping[sku.lower()] = canonical
+    log.info("Loaded %d SKU -> service mappings from %s", len(mapping), SKU_MAP_PATH.name)
+    return mapping
+
+
+SKU_TO_SERVICE = load_sku_services()
+
+
+# ──────────────────────────────────────────────
+# STORE ID DETECTION
+# ──────────────────────────────────────────────
+# A line item with SKU 'GE-OID-15' indicates the order belongs to store
+# (outlet) 15. This lets the webapp skip the manual store-ID prompt and
+# go straight to the WhatsApp send-out step.
+STORE_ID_PATTERN = re.compile(r"^GE-OID-(\d+)$", re.IGNORECASE)
+
+
+def extract_store_id(line_items: list[dict]) -> str:
+    """
+    Returns the store ID as a string ('1'..'100') if any line item's SKU
+    matches GE-OID-N. Returns '' when no match. Logs a warning if more
+    than one distinct OID appears in the same order (uses the first).
+    """
+    found: list[str] = []
     for item in line_items:
-        title = (item.get("title") or "").lower()
-        for keyword, label in SERVICE_KEYWORDS.items():
-            if keyword in title and label not in found:
-                found.append(label)
+        sku = (item.get("sku") or "").strip()
+        m = STORE_ID_PATTERN.match(sku)
+        if not m:
+            continue
+        n = int(m.group(1))
+        if 1 <= n <= 100:
+            found.append(str(n))
+    if not found:
+        return ""
+    if len(set(found)) > 1:
+        log.warning(
+            "Multiple distinct store IDs in one order: %s — using first ('%s')",
+            found, found[0],
+        )
+    return found[0]
+
+
+# ──────────────────────────────────────────────
+# SERVICE MAPPING (Shopify line item SKU → app label)
+# ──────────────────────────────────────────────
+def map_services(line_items: list[dict]) -> str | None:
+    """Combine all matched services into one label (e.g. 'Sharpening + Kydex')."""
+    found: list[str] = []
+    for item in line_items:
+        sku = (item.get("sku") or "").strip().lower()
+        if not sku:
+            continue
+        label = SKU_TO_SERVICE.get(sku)
+        if label and label not in found:
+            found.append(label)
 
     if not found:
         return None
@@ -104,33 +210,30 @@ def map_services(line_items: list[dict]) -> str | None:
 
 def extract_service_line_items(line_items: list[dict]) -> tuple[list[dict], float, int]:
     """
-    Returns (matched_items, total_sales, total_quantity) for line items that match
-    one of our tracked services.
+    Returns (matched_items, total_sales, total_quantity) for line items
+    whose SKU is in our service mapping. GE-OID-N store-marker SKUs are
+    excluded (they're not in the mapping CSV) and so don't count toward
+    sales/qty totals.
 
     Each matched_item is:
         {
-          "title":    str,          # original Shopify product title
-          "service":  str,          # mapped app label (Sharpening/Engraving/Kydex Sheath)
+          "title":    str,    # original Shopify product title
+          "sku":      str,    # the matched SKU (preserves original case)
+          "service":  str,    # mapped app label
           "quantity": int,
-          "price":    float,        # per-unit price
-          "subtotal": float,        # price * quantity (before discounts)
+          "price":    float,  # per-unit price
+          "subtotal": float,  # price * quantity (before discounts)
         }
-
-    Sales are computed from Shopify's `price` field (in store currency, e.g. RM).
     """
     matched: list[dict] = []
     total_sales = 0.0
     total_qty   = 0
 
     for item in line_items:
-        title = (item.get("title") or "").lower()
-
-        # Find the mapped service label (first keyword match wins)
-        label = None
-        for keyword, mapped in SERVICE_KEYWORDS.items():
-            if keyword in title:
-                label = mapped
-                break
+        sku = (item.get("sku") or "").strip()
+        if not sku:
+            continue
+        label = SKU_TO_SERVICE.get(sku.lower())
         if not label:
             continue
 
@@ -148,6 +251,7 @@ def extract_service_line_items(line_items: list[dict]) -> tuple[list[dict], floa
 
         matched.append({
             "title":    item.get("title") or "",
+            "sku":      sku,
             "service":  label,
             "quantity": qty,
             "price":    price,
@@ -167,18 +271,18 @@ def map_fulfilment_type(order: dict) -> tuple[str, str]:
     Returns (fulfilmentType, carrierName).
 
     The store's configured delivery methods in Shopify are:
-      1. "In store"              → In-Store Pickup
-      2. "Shipping"              → Shipping (generic)
-      3. "TikTok"                → Shipping (TikTok)
-      4. "PosLaju"               → Shipping (PosLaju)
-      5. "J&T (Peninsular only)" → Shipping (J&T Express)
+      1. "In store"              -> In-Store Pickup
+      2. "Shipping"              -> Shipping (generic)
+      3. "TikTok"                -> Shipping (TikTok)
+      4. "PosLaju"               -> Shipping (PosLaju)
+      5. "J&T (Peninsular only)" -> Shipping (J&T Express)
 
     Additional detection:
       - TikTok Shop orders sometimes arrive WITHOUT shipping_lines because
         TikTok handles fulfilment on their side. We detect these via
         order.source_name containing "tiktok" (or similar marketplace
         indicators) and classify them as Shipping/TikTok.
-      - Orders with no shipping_lines AND no marketplace source → In-Store
+      - Orders with no shipping_lines AND no marketplace source -> In-Store
         Pickup (genuine walk-in / POS orders).
     """
     shipping_lines = order.get("shipping_lines") or []
@@ -226,15 +330,10 @@ def map_fulfilment_type(order: dict) -> tuple[str, str]:
                     return "Shipping", display_name
 
         # Has shipping lines but no keyword matched — fall through to raw title.
-        # The literal delivery method "Shipping" (one of the store's 5 methods)
-        # lands here and gets "Shipping" as its carrier display name, which is fine.
         raw_title = (shipping_lines[0].get("title") or "").strip() or "Shipping"
         return "Shipping", raw_title
 
     # ── Step 2: No shipping_lines. Check marketplace/source signals first. ──
-    # TikTok Shop orders sometimes arrive with source_name containing "tiktok"
-    # (e.g. "tiktok", "tiktok_shop") and no shipping lines because fulfilment
-    # is handled on TikTok's side.
     MARKETPLACE_SOURCES = [
         (["tiktok", "tik_tok"], "TikTok"),
         (["shopee"],            "Shopee"),
@@ -244,18 +343,13 @@ def map_fulfilment_type(order: dict) -> tuple[str, str]:
         if any(kw in source_name for kw in keywords):
             return "Shipping", display_name
 
-    # ── Step 3: Draft orders (source_name="shopify_draft_order") or any other
-    # order with no shipping line. The decisive signal is whether the customer
-    # has a shipping address attached. If yes → it's a shipping order (the staff
-    # just didn't attach a shipping line fee in the draft). If no → genuine
-    # walk-in / in-store pickup.
+    # ── Step 3: Draft orders or any other order with no shipping line.
+    # The decisive signal is whether the customer has a shipping address.
     shipping_address = order.get("shipping_address")
     if shipping_address and isinstance(shipping_address, dict):
-        # Has a shipping address → customer intends it to be shipped.
-        # We don't know which carrier, so label it generically as "Shipping".
         return "Shipping", "Shipping"
 
-    # ── Step 4: No shipping lines, no marketplace, no shipping address → walk-in ──
+    # ── Step 4: No shipping lines, no marketplace, no shipping address ──
     return "In-Store Pickup", ""
 
 
@@ -290,6 +384,7 @@ def fetch_shopify_orders(lookback_minutes: int) -> list[dict]:
         "limit":          250,
         # source_name, tags, and shipping_address help classify orders that
         # arrive without shipping_lines (draft orders, TikTok/marketplace, etc.)
+        # line_items already includes 'sku' by default, no need to request it.
         "fields": (
             "id,order_number,name,customer,line_items,"
             "created_at,financial_status,"
@@ -356,12 +451,6 @@ def get_relevant_shopify_docs(
     Returns { shopifyOrderId: (firestoreDocId, docData) }
 
     Queries only the specific shopifyOrderIds returned in this batch.
-    This requires no composite index and works on Firestore free tier.
-    Covers all cases:
-      - New order     → not in result → will be inserted
-      - Edited order  → found → will be patched
-      - Cancelled     → found → will be transitioned
-      - Already synced, no changes → found → skipped
     """
     result: dict[str, tuple[str, dict]] = {}
 
@@ -399,8 +488,8 @@ def main():
 
     raw_orders = fetch_shopify_orders(lookback_minutes)
 
-    # Extract IDs for orders that match our services — these are the only ones
-    # we'll ever read or write, so no point querying Firestore for others
+    # Extract IDs for orders that match a service SKU — these are the only
+    # ones we'll ever read or write, so no point querying Firestore for others
     batch_ids = [
         str(o["id"])
         for o in raw_orders
@@ -420,10 +509,13 @@ def main():
 
         service = map_services(line_items)
         if not service:
-            continue  # not one of our services — ignore
+            continue  # no service SKU in this order — ignore
 
         # ── Extract line item details (for reporting: qty, sales) ──
         matched_items, total_sales, total_qty = extract_service_line_items(line_items)
+
+        # ── Store ID from GE-OID-N marker SKU (if present) ──
+        extracted_store_id = extract_store_id(line_items)
 
         # ── Customer info ──────────────────────────────────────────
         customer   = order.get("customer") or {}
@@ -450,19 +542,17 @@ def main():
 
         fulfilment_type, carrier_name = map_fulfilment_type(order)
 
-        # Diagnostic log — helps debug future misclassifications.
-        # Shows what Shopify actually sent so we can tell at a glance whether
-        # shipping_lines was empty, what source_name was, etc.
+        # Diagnostic log — helps debug future misclassifications
         shipping_titles = [
             (sl.get("title") or sl.get("code") or "").strip()
             for sl in (order.get("shipping_lines") or [])
         ]
         has_ship_addr = bool(order.get("shipping_address"))
         log.info(
-            "Fulfilment for %s (%s): type=%s carrier=%s | shipping_lines=%s | source_name=%s | has_shipping_address=%s",
+            "Fulfilment for %s (%s): type=%s carrier=%s | shipping_lines=%s | source_name=%s | has_shipping_address=%s | storeId=%s",
             shopify_id, order_name, fulfilment_type, carrier_name or "—",
             shipping_titles or "[]", order.get("source_name") or "—",
-            has_ship_addr,
+            has_ship_addr, extracted_store_id or "—",
         )
 
         is_cancelled      = bool(order.get("cancelled_at"))
@@ -502,15 +592,20 @@ def main():
             if fs_data.get("carrierName")      != carrier_name:    updates["carrierName"]      = carrier_name
             if fs_data.get("note")             != note:            updates["note"]             = note
 
-            # Sync reporting fields (line items, totals) — always refresh so edits on Shopify propagate
+            # Sync reporting fields — always refresh so edits on Shopify propagate
             if fs_data.get("lineItems")   != matched_items: updates["lineItems"]   = matched_items
             if fs_data.get("totalSales")  != total_sales:   updates["totalSales"]  = total_sales
             if fs_data.get("totalQty")    != total_qty:     updates["totalQty"]    = total_qty
 
+            # Store ID: only patch when Shopify gave us one and it differs.
+            # Never blank out an existing manually-entered storeId.
+            existing_store_id = (fs_data.get("storeId") or "").strip()
+            if extracted_store_id and extracted_store_id != existing_store_id:
+                updates["storeId"] = extracted_store_id
+
             # Sync createdAt to Shopify's actual order creation date
             existing_created = fs_data.get("createdAt")
             if existing_created and hasattr(existing_created, 'timestamp'):
-                # Compare timestamps — if they differ by more than 60s, update
                 if abs(existing_created.timestamp() - shopify_created_at.timestamp()) > 60:
                     updates["createdAt"] = shopify_created_at
             elif not existing_created:
@@ -531,8 +626,7 @@ def main():
             else:
                 log.debug("No changes for order %s", shopify_id)
 
-            # Auto-collect if the order became Express/Engraving and
-            # isn't already in a terminal state
+            # Auto-collect if the order became Express/Engraving and isn't terminal
             current_status = fs_data.get("status", "pending")
             if (
                 is_auto_collect(service, note)
@@ -562,7 +656,8 @@ def main():
                 "totalQty":         total_qty,
                 "fulfilmentType":   fulfilment_type,
                 "carrierName":      carrier_name,
-                "storeId":          "",
+                # Auto-filled from GE-OID-N when present, else "" (webapp prompts to fill)
+                "storeId":          extracted_store_id,
                 "status":           "cancelled" if is_cancelled else ("collected" if auto_collect else "pending"),
                 "source":           "shopify",
                 "note":             note,
@@ -580,9 +675,10 @@ def main():
             existing_docs[shopify_id] = ("", doc)
             added += 1
             log.info(
-                "Added order %s (%s) — service: %s | fulfilment: %s%s%s%s",
+                "Added order %s (%s) — service: %s | fulfilment: %s%s | storeId: %s%s%s",
                 shopify_id, order_name, service, fulfilment_type,
                 f" [{carrier_name}]" if carrier_name else "",
+                extracted_store_id or "—",
                 " [CANCELLED]"      if is_cancelled  else "",
                 " [AUTO-COLLECTED]" if auto_collect  else "",
             )
