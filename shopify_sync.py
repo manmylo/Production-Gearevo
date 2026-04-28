@@ -488,6 +488,23 @@ def main():
 
     raw_orders = fetch_shopify_orders(lookback_minutes)
 
+    # ── Diagnostic accumulators (reported at end of run) ──
+    # These help answer "why didn't order #41679 sync?" without manually
+    # poking around — the summary at the bottom of the log shows exactly
+    # which SKUs got dropped and which line items had no SKU at all.
+    diag_skipped_orders     = 0
+    diag_unmatched_sku_count: dict[str, int] = {}   # unknown SKU -> times seen
+    diag_unmatched_examples: dict[str, str]   = {}  # unknown SKU -> sample title
+    diag_no_sku_items: list[tuple[str, str, str]] = []  # (order_name, source, title)
+
+    # Hint keywords — used ONLY for the diagnostic warning about line
+    # items that have no SKU but look like services. They do not affect
+    # matching itself; that's still pure SKU.
+    DIAG_TITLE_HINTS = (
+        "servis asah", "asah pisau", "kydex", "engraving", "engrav",
+        "sandwich", "belt loop", "perbaiki sumbing",
+    )
+
     # Extract IDs for orders that match a service SKU — these are the only
     # ones we'll ever read or write, so no point querying Firestore for others
     batch_ids = [
@@ -509,7 +526,24 @@ def main():
 
         service = map_services(line_items)
         if not service:
-            continue  # no service SKU in this order — ignore
+            # ── Diagnostic: this order didn't match any service SKU ──
+            # Record what was in it so the run summary can pinpoint
+            # missing entries in sku_services.csv or POS items with
+            # blank SKUs.
+            diag_skipped_orders += 1
+            order_name = order.get("name", "")
+            source     = order.get("source_name", "") or "—"
+            for item in line_items:
+                sku   = (item.get("sku") or "").strip()
+                title = (item.get("title") or "").strip()
+                if sku:
+                    diag_unmatched_sku_count[sku] = diag_unmatched_sku_count.get(sku, 0) + 1
+                    diag_unmatched_examples.setdefault(sku, title)
+                else:
+                    title_l = title.lower()
+                    if any(kw in title_l for kw in DIAG_TITLE_HINTS):
+                        diag_no_sku_items.append((order_name, source, title))
+            continue  # not one of our services — ignore
 
         # ── Extract line item details (for reporting: qty, sales) ──
         matched_items, total_sales, total_qty = extract_service_line_items(line_items)
@@ -682,6 +716,46 @@ def main():
                 " [CANCELLED]"      if is_cancelled  else "",
                 " [AUTO-COLLECTED]" if auto_collect  else "",
             )
+
+    # ──────────────────────────────────────────────
+    # DIAGNOSTIC SUMMARY  (added to help debug missing orders)
+    # ──────────────────────────────────────────────
+    if diag_skipped_orders or diag_unmatched_sku_count or diag_no_sku_items:
+        log.info("=" * 64)
+        log.info("DIAGNOSTIC SUMMARY")
+        log.info("Total Shopify orders fetched:      %d", len(raw_orders))
+        log.info("Matched (one+ SKU in mapping):     %d", len(batch_ids))
+        log.info("Skipped (no SKU matched):          %d", diag_skipped_orders)
+        if diag_unmatched_sku_count:
+            log.info("")
+            log.info("Top unmatched SKUs (not in sku_services.csv) — add these to the CSV if they are services:")
+            top = sorted(diag_unmatched_sku_count.items(), key=lambda x: (-x[1], x[0]))[:25]
+            for sku, count in top:
+                example = diag_unmatched_examples.get(sku, "")
+                log.info("  %-30s  seen %3d time(s)  | example title: %s",
+                         sku, count, example[:60])
+        if diag_no_sku_items:
+            log.info("")
+            log.warning(
+                "Line items with NO SKU but title looks like a service "
+                "(%d total) — fix the SKU on these products in Shopify, or "
+                "they will keep being skipped:",
+                len(diag_no_sku_items),
+            )
+            seen: set[tuple[str, str]] = set()
+            shown = 0
+            for order_name, source, title in diag_no_sku_items:
+                key = (order_name, title)
+                if key in seen:
+                    continue
+                seen.add(key)
+                log.warning("  %-10s  source=%-15s  title=%s",
+                            order_name, source[:15], title[:60])
+                shown += 1
+                if shown >= 25:
+                    log.warning("  ... and %d more", len(diag_no_sku_items) - shown)
+                    break
+        log.info("=" * 64)
 
     log.info(
         "Sync complete. %d added, %d updated (%d cancellations).",
