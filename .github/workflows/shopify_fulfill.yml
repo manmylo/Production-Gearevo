@@ -14,7 +14,10 @@ on:
 jobs:
   fulfill:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    # 5 min (was 3). Fulfill itself is ~2s, but actions/checkout sometimes
+    # retries on transient GitHub 5xx — give those retries room before being
+    # killed by the timeout.
+    timeout-minutes: 5
 
     steps:
       - name: Checkout repository
