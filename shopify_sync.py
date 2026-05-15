@@ -186,9 +186,9 @@ def map_services(line_items: list[dict]) -> str | None:
     if not found:
         return None
 
-    has_sharp   = "Sharpening"   in found
-    has_kydex   = "Kydex Sheath" in found
-    has_engrave = "Engraving"    in found
+    has_sharp   = any(s in found for s in ("Sharpening", "Sharpening Add-on"))
+    has_kydex   = any(s in found for s in ("Kydex Sheath", "Kydex", "Kydex Add-on"))
+    has_engrave = any(s in found for s in ("Engraving", "Engraving Add-on"))
 
     if has_sharp and has_kydex and has_engrave:
         return "Sharpening + Kydex + Engraving"
