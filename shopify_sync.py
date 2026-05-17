@@ -60,9 +60,23 @@ SA_JSON              = os.environ["FIREBASE_SERVICE_ACCOUNT_JSON"]
 def get_lookback_minutes() -> int:
     """
     Returns the lookback window in minutes.
+    - If SYNC_DATE is set (e.g. '2026-05-17') -> calculate minutes since start of that day
     - If SYNC_LOOKBACK_HOURS is set and non-empty -> use that (converted to minutes)
     - Otherwise default to 10 minutes (normal cron interval)
     """
+    # Date-based sync: fetch all orders from a specific date
+    date_str = os.environ.get("SYNC_DATE", "").strip()
+    if date_str:
+        try:
+            target = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            now = datetime.now(timezone.utc)
+            diff = now - target
+            minutes = int(diff.total_seconds() / 60)
+            log.info("Date sync: fetching orders since %s (%d minutes ago)", date_str, minutes)
+            return max(minutes, 1)
+        except ValueError:
+            log.warning("Invalid SYNC_DATE '%s' (expected YYYY-MM-DD), falling back", date_str)
+
     hours_str = os.environ.get("SYNC_LOOKBACK_HOURS", "").strip()
     if hours_str:
         try:
@@ -329,9 +343,10 @@ def map_fulfilment_type(order: dict) -> tuple[str, str]:
                 if any(kw in combined for kw in keywords):
                     return "Shipping", display_name
 
-        # Has shipping lines but no keyword matched — fall through to raw title.
-        raw_title = (shipping_lines[0].get("title") or "").strip() or "Shipping"
-        return "Shipping", raw_title
+        # Has shipping lines but no keyword matched — default to In-Store
+        # Pickup. Shopify sometimes auto-adds a generic shipping line when a
+        # customer has an address on file, even if no shipping is configured.
+        return "In-Store Pickup", ""
 
     # ── Step 2: No shipping_lines. Check marketplace/source signals first. ──
     MARKETPLACE_SOURCES = [
@@ -466,13 +481,15 @@ def get_relevant_shopify_docs(
     Returns { shopifyOrderId: (firestoreDocId, docData) }
 
     Queries only the specific shopifyOrderIds returned in this batch.
+    If duplicates exist for the same shopifyOrderId, keeps the one with
+    a storeId (or the most recently created) and deletes the rest.
     """
-    result: dict[str, tuple[str, dict]] = {}
+    # Collect ALL docs per shopifyOrderId (may have duplicates)
+    all_docs: dict[str, list[tuple[str, dict]]] = {}
 
     if not batch_ids:
-        return result
+        return {}
 
-    # Firestore "in" operator supports max 30 values — chunk if needed
     def chunks(lst, n):
         for i in range(0, len(lst), n):
             yield lst[i:i + n]
@@ -487,7 +504,29 @@ def get_relevant_shopify_docs(
             data = d.to_dict()
             sid  = data.get("shopifyOrderId")
             if sid:
-                result[sid] = (d.id, data)
+                all_docs.setdefault(sid, []).append((d.id, data))
+
+    # Dedup — keep best doc, delete extras
+    result: dict[str, tuple[str, dict]] = {}
+    for sid, doc_list in all_docs.items():
+        if len(doc_list) == 1:
+            result[sid] = doc_list[0]
+        else:
+            # Prefer doc with storeId, then with more fields, then newest
+            doc_list.sort(key=lambda x: (
+                bool(x[1].get("storeId")),      # has storeId = better
+                bool(x[1].get("printedAt")),     # has been printed = better
+                len(x[1]),                        # more fields = better
+            ), reverse=True)
+            keeper = doc_list[0]
+            result[sid] = keeper
+            for dup_id, dup_data in doc_list[1:]:
+                try:
+                    db.collection("orders").document(dup_id).delete()
+                    log.warning("Deleted duplicate doc %s for shopifyOrderId %s (kept %s)",
+                                dup_id, sid, keeper[0])
+                except Exception as e:
+                    log.error("Failed to delete duplicate %s: %s", dup_id, e)
 
     log.info("Firestore lookup: %d/%d batch IDs already exist", len(result), len(batch_ids))
     return result
@@ -720,8 +759,11 @@ def main():
                 doc["shopifyCancelReason"] = cancel_reason
                 doc["cancelledAt"]         = firestore.SERVER_TIMESTAMP
 
-            db.collection("orders").add(doc)
-            existing_docs[shopify_id] = ("", doc)
+            # Use shopifyOrderId as the Firestore doc ID — guarantees
+            # uniqueness even if two sync runs overlap.
+            doc_ref = db.collection("orders").document(shopify_id)
+            doc_ref.set(doc)
+            existing_docs[shopify_id] = (shopify_id, doc)
             added += 1
             log.info(
                 "Added order %s (%s) — service: %s | fulfilment: %s%s | storeId: %s%s%s",
