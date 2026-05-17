@@ -8,6 +8,11 @@ on:
         required: false
         type: string
         default: ''
+      date:
+        description: 'Sync a specific date (YYYY-MM-DD, e.g. 2026-05-17). Overrides hours.'
+        required: false
+        type: string
+        default: ''
 
   repository_dispatch:
     types: [shopify-sync]
@@ -44,4 +49,5 @@ jobs:
           FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
           FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
           SYNC_LOOKBACK_HOURS: ${{ github.event.inputs.hours || github.event.client_payload.hours || '' }}
+          SYNC_DATE: ${{ github.event.inputs.date || github.event.client_payload.date || '' }}
         run: python shopify_sync.py
