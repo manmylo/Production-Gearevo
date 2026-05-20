@@ -378,24 +378,19 @@ def is_auto_collect(service: str, note: str) -> bool:
     on insert.
 
     Business rules:
-      - Anything containing Kydex always needs the full workflow,
-        regardless of any Express tag. Kydex sheaths can't be done
-        on-the-spot.
+      - Anything containing Kydex always needs the full workflow.
       - Engraving-only orders are done in front of the customer and
         auto-collect.
-      - Express is a Sharpening-only add-on (SKU GE-AON:EXPRESS).
-        When present on a non-Kydex order it shortcuts to
-        auto-collect. If it ever lands on a Kydex order (data error),
-        the Kydex veto above keeps it on the workflow.
+      - Express orders now need printing first (pending-reg -> print -> collected),
+        so they are NOT auto-collected by the sync anymore.
     """
     svc_l  = (service or "").strip().lower()
-    note_l = (note or "").lower()
 
     if "kydex" in svc_l:
         return False
     if svc_l == "engraving":
         return True
-    return "express" in note_l
+    return False
 
 
 # ──────────────────────────────────────────────
