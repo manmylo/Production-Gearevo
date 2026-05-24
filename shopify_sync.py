@@ -720,8 +720,25 @@ def main():
                     "collectedAt": firestore.SERVER_TIMESTAMP,
                 })
                 log.info(
-                    "Auto-collected order %s (%s) — Express/Engraving shortcut",
+                    "Auto-collected order %s (%s) — Engraving shortcut",
                     shopify_id, order_name,
+                )
+
+            # Un-collect: if order was auto-collected but service changed
+            # to include Kydex (which requires full workflow), revert to pending
+            if (
+                current_status == "collected"
+                and not is_auto_collect(service, note)
+                and "kydex" in (service or "").lower()
+                and not fs_data.get("printedAt")  # don't revert if staff already printed
+            ):
+                ref.update({
+                    "status":      "pending",
+                    "collectedAt": None,
+                })
+                log.info(
+                    "Un-collected order %s (%s) — service changed to %s, needs full workflow",
+                    shopify_id, order_name, service,
                 )
 
         else:
