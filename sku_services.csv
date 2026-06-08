@@ -1,6 +1,6 @@
-﻿product_name,sku,service
-Servis Asah Pisau (Tambahan Perkhidmatan Lain - Setiap 10 Minit),GE-AA.TP,Sharpening
-Servis Asah Pisau (ADD ON: EXPRESS),GE-AON:EXPRESS,Sharpening
+product_name,sku,service
+Servis Asah Pisau (Tambahan Perkhidmatan Lain - Setiap 10 Minit),GE-AA.TP,Sharpening Add-on
+Servis Asah Pisau (ADD ON: EXPRESS),GE-AON:EXPRESS,Sharpening Add-on
 Servis Asah Pisau Perbaiki Sumbing Bilah 6-9 Inci (1-3mm),GE-PS.6-9,Sharpening
 Servis Asah Pisau Perbaiki Sumbing Bilah 10-14 Inci (1-3mm),GE-PS.10-14,Sharpening
 Servis Asah Pisau Perbaiki Sumbing - Bilah Kurang 6 Inci (1-3mm),GE-PS.0-6,Sharpening
@@ -9,7 +9,7 @@ Servis Asah Pisau (Asahan Asas - Bilah 6-9 Inci),GE-AA.6-9,Sharpening
 Servis Asah Pisau (Asahan Asas - Bilah 10-14 Inci),GE-AA.10-14,Sharpening
 LASER ENGRAVING SERVICE - 4TH TO 50TH KNIFE SAME NAME,GE-LENG,Engraving
 LASER ENGRAVING - 1ST TO 3RD KNIFE,GE-LENG1,Engraving
-LASER ENGRAVING SERVICE - ADDITIONAL ROW,GE-LEADROW,Engraving
+LASER ENGRAVING SERVICE - ADDITIONAL ROW,GE-LEADROW,Engraving Add-on
 LASER ENGRAVING SERVICE - ARABIC FONT 1 ST TO 3RD KNIFE,GE-LEARAB,Engraving
 LASER ENGRAVING SERVICE - ARABIC FONT 4TH TO 50TH KNIFE,GE-LEARAB-4TO50,Engraving
 LASER ENGRAVING SERVICE - LOGO 1 ST TO 3RD KNIFE,GE-LELOGO,Engraving
@@ -43,12 +43,12 @@ Gearevo Kydex Sheath Carbon Fiber - 1.5 mm (5-7 Inch),GE-KYCF.5-7,Kydex
 Gearevo Kydex Sheath Carbon Fiber - 1.5 mm (10-14 Inch),GE-KYCF.10-14,Kydex
 Gearevo Kydex Sheath Black Color - 1.5 mm (8-9 Inch),GE-KYBLK.8-9,Kydex
 Gearevo Kydex Sheath Black Color - 1.5 mm (10-14 Inch),GE-KYBLK.10-14,Kydex
-Gearevo Kydex Sheath Black Color - 1.5 mm  (5-7 Inch),GE-KYBLK.5-7,Kydex
-Gearevo Belt Loops For Kydex Sheath A,GE-KYBLT.A,Kydex
-Gearevo Belt Loops For Kydex Sheath B,GE-KYBLT.B,Kydex
-Gearevo Belt Loops For Kydex Sheath C,GE-KYBLT.C,Kydex
-Gearevo Sandwich Style For Kydex Sheath (8-9 Inch),GE-SAND.8-9,Kydex
-Gearevo Sandwich Style For Kydex Sheath (5-7 Inch),GE-SAND.5-7,Kydex
-Gearevo Sandwich Style For Kydex Sheath (10-14 Inch),GE-SAND.10-14,Kydex
-Gearevo Kawin For Kydex Sheath,GE-KYKWIN,Kydex
-Gearevo Belt Clip For Kydex Sheath,GE-KYBLTCLP,Kydex
+Gearevo Kydex Sheath Black Color - 1.5 mm (5-7 Inch),GE-KYBLK.5-7,Kydex
+Gearevo Belt Loops For Kydex Sheath A,GE-KYBLT.A,Kydex Add-on
+Gearevo Belt Loops For Kydex Sheath B,GE-KYBLT.B,Kydex Add-on
+Gearevo Belt Loops For Kydex Sheath C,GE-KYBLT.C,Kydex Add-on
+Gearevo Sandwich Style For Kydex Sheath (8-9 Inch),GE-SAND.8-9,Kydex Add-on
+Gearevo Sandwich Style For Kydex Sheath (5-7 Inch),GE-SAND.5-7,Kydex Add-on
+Gearevo Sandwich Style For Kydex Sheath (10-14 Inch),GE-SAND.10-14,Kydex Add-on
+Gearevo Kawin For Kydex Sheath,GE-KYKWIN,Kydex Add-on
+Gearevo Belt Clip For Kydex Sheath,GE-KYBLTCLP,Kydex Add-on
