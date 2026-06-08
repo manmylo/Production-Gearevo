@@ -710,10 +710,12 @@ def main():
             else:
                 log.debug("No changes for order %s", shopify_id)
 
-            # Auto-collect if the order became Express/Engraving and isn't terminal
+            # Auto-collect if the order is pure Engraving and isn't terminal.
+            # Express orders are explicitly excluded — they need printing first.
             current_status = fs_data.get("status", "pending")
             if (
                 is_auto_collect(service, note)
+                and not is_express
                 and current_status not in ("collected", "cancelled")
             ):
                 ref.update({
@@ -742,9 +744,33 @@ def main():
                     shopify_id, order_name, service,
                 )
 
+            # Fix express orders that were incorrectly auto-collected
+            # (before the express guard was added). Only reverts if staff
+            # hasn't printed yet — printedAt means it was legitimately collected.
+            if (
+                is_express
+                and current_status == "collected"
+                and not fs_data.get("printedAt")
+            ):
+                ref.update({
+                    "status":      "pending",
+                    "collectedAt": None,
+                })
+                log.info(
+                    "Reverted express order %s (%s) — was auto-collected without printing, needs print first",
+                    shopify_id, order_name,
+                )
+
         else:
             # ── INSERT ─────────────────────────────────────────────
-            auto_collect = is_auto_collect(service, note)
+            # Express orders NEVER auto-collect — they need printing first
+            auto_collect = is_auto_collect(service, note) and not is_express
+
+            if is_express:
+                log.info(
+                    "Express order %s (%s) — service: %s | auto_collect forced OFF (needs print first)",
+                    shopify_id, order_name, service,
+                )
 
             doc = {
                 "shopifyOrderId":   shopify_id,
@@ -779,12 +805,13 @@ def main():
             existing_docs[shopify_id] = (shopify_id, doc)
             added += 1
             log.info(
-                "Added order %s (%s) — service: %s | fulfilment: %s%s | storeId: %s%s%s",
+                "Added order %s (%s) — service: %s | fulfilment: %s%s | storeId: %s%s%s%s",
                 shopify_id, order_name, service, fulfilment_type,
                 f" [{carrier_name}]" if carrier_name else "",
                 extracted_store_id or "—",
                 " [CANCELLED]"      if is_cancelled  else "",
-                " [AUTO-COLLECTED]" if auto_collect  else "",
+                " [AUTO-COLLECTED]" if auto_collect   else "",
+                " [EXPRESS]"        if is_express     else "",
             )
 
     # ──────────────────────────────────────────────
