@@ -24,7 +24,8 @@ Other behaviour (unchanged):
   - CANCELLED orders  -> status 'cancelled', shopifyCancelReason added,
                           storeId requirement bypassed
   - Delivery method   -> fulfilmentType: 'Shipping' | 'In-Store Pickup'
-  - EXPRESS / pure-Engraving orders -> auto-collected on insert
+  - EXPRESS orders       -> pending (needs print before collected)
+  - pure-Engraving orders -> auto-collected on insert
 
 Lookback window:
   - Default: 10 minutes (regular cron sync)
